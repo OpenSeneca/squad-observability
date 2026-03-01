@@ -1,599 +1,463 @@
 #!/usr/bin/env python3
 """
-Squad Observability CLI
-Monitor, trace, and analyze squad agent operations with AI observability.
+Squad Observability Layer — Monitor and debug squad agent operations
+
+This tool provides centralized observability for squad tools, including:
+- Tracing for agent operations
+- Performance metrics collection
+- Error monitoring and alerting
+- Dashboard generation
+
+Inspired by Logfire, LangSmith, and OpenTelemetry patterns.
 """
 
 import argparse
 import json
 import os
-import sqlite3
 import sys
-import subprocess
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 import time
-import socket
-
-# Constants
-CONFIG_DIR = Path.home() / ".config" / "squad-observability"
-DATA_DIR = Path.home() / ".local" / "share" / "squad-observability"
-CONFIG_FILE = CONFIG_DIR / "config.toml"
-DB_PATH = DATA_DIR / "squad-obs.db"
-DEFAULT_CHECK_INTERVAL = 60  # seconds
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
-def ensure_directories():
-    """Ensure config and data directories exist."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "data_dir": "~/.openclaw/workspace/tools/squad-observability/data",
+    "trace_dir": "~/.openclaw/workspace/tools/squad-observability/traces",
+    "alert_thresholds": {
+        "error_rate": 0.1,  # Alert if error rate > 10%
+        "latency_ms": 5000,  # Alert if operation takes > 5s
+        "memory_mb": 500,  # Alert if memory usage > 500MB
+    },
+}
 
 
-def init_db():
-    """Initialize SQLite database with observability schema."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    # Agents table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS agents (
-            id INTEGER PRIMARY KEY,
-            name TEXT UNIQUE NOT NULL,
-            role TEXT,
-            host TEXT,
-            port INTEGER,
-            agent_type TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    # Health checks table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS health_checks (
-            id INTEGER PRIMARY KEY,
-            agent_id INTEGER,
-            status TEXT,
-            response_time REAL,
-            checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (agent_id) REFERENCES agents(id)
-        )
-    ''')
-
-    # Outputs table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS outputs (
-            id INTEGER PRIMARY KEY,
-            agent_id INTEGER,
-            content TEXT,
-            topic TEXT,
-            quality_score REAL,
-            captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (agent_id) REFERENCES agents(id)
-        )
-    ''')
-
-    # Metrics table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS metrics (
-            id INTEGER PRIMARY KEY,
-            agent_id INTEGER,
-            metric_name TEXT,
-            metric_value REAL,
-            computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (agent_id) REFERENCES agents(id)
-        )
-    ''')
-
-    # Alerts table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS alerts (
-            id INTEGER PRIMARY KEY,
-            agent_id INTEGER,
-            alert_type TEXT,
-            severity TEXT,
-            message TEXT,
-            resolved BOOLEAN DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            resolved_at TIMESTAMP,
-            FOREIGN KEY (agent_id) REFERENCES agents(id)
-        )
-    ''')
-
-    conn.commit()
-    conn.close()
+def get_config_path() -> Path:
+    """Get path to config file."""
+    return Path.home() / ".openclaw" / "tools" / "squad-observability" / "config.json"
 
 
-def load_config() -> Dict:
-    """Load configuration from file or use defaults."""
-    defaults = {
-        'agents': {
-            'marcus': {'host': 'marcus-squad', 'port': 22, 'type': 'ssh'},
-            'galen': {'host': 'galen-squad', 'port': 22, 'type': 'ssh'},
-            'archimedes': {'host': 'localhost', 'type': 'local'},
-            'argus': {'host': 'argus-squad', 'port': 22, 'type': 'ssh'},
-        },
-        'monitoring': {
-            'check_interval': 60,
-            'output_retention_days': 30,
-        },
-        'alerts': {
-            'enabled': True,
-            'max_error_rate': 0.05,
-            'max_response_time': 30,
-        },
-        'storage': {
-            'db_path': str(DB_PATH),
+def load_config() -> Dict[str, Any]:
+    """Load configuration from file or return defaults."""
+    config_path = get_config_path()
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            return json.load(f)
+    return DEFAULT_CONFIG.copy()
+
+
+def save_config(config: Dict[str, Any]) -> None:
+    """Save configuration to file."""
+    config_path = get_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def expand_path(path: str) -> Path:
+    """Expand ~ and environment variables in path."""
+    return Path(os.path.expandvars(os.path.expanduser(path)))
+
+
+# -----------------------------------------------------------------------------
+# Tracing
+# -----------------------------------------------------------------------------
+
+class Tracer:
+    """Simple tracing for squad operations."""
+
+    def __init__(self, tool_name: str, config: Dict[str, Any]):
+        self.tool_name = tool_name
+        self.config = config
+        self.trace_dir = expand_path(config.get("trace_dir", DEFAULT_CONFIG["trace_dir"]))
+        self.trace_dir.mkdir(parents=True, exist_ok=True)
+        self.spans: List[Dict[str, Any]] = []
+        self.current_span: Optional[Dict[str, Any]] = None
+
+    def start_span(self, operation: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Start a new span."""
+        span = {
+            "tool": self.tool_name,
+            "operation": operation,
+            "start_time": datetime.utcnow().isoformat(),
+            "metadata": metadata or {},
         }
-    }
+        self.current_span = span
+        return span
 
-    if CONFIG_FILE.exists():
-        # Simple config parsing (TOML-like)
-        with open(CONFIG_FILE, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if '=' in line and not line.startswith('#'):
-                    key, value = line.split('=', 1)
-                    # Parse simple key=value format
-                    pass
+    def end_span(self, error: Optional[str] = None) -> None:
+        """End the current span."""
+        if self.current_span is None:
+            return
 
-    return defaults
+        self.current_span["end_time"] = datetime.utcnow().isoformat()
+        self.current_span["error"] = error
 
+        # Calculate duration
+        start = datetime.fromisoformat(self.current_span["start_time"])
+        end = datetime.fromisoformat(self.current_span["end_time"])
+        duration_ms = (end - start).total_seconds() * 1000
+        self.current_span["duration_ms"] = round(duration_ms, 2)
 
-def get_agent_id(conn: sqlite3.Connection, name: str) -> Optional[int]:
-    """Get agent ID by name."""
-    cursor = conn.cursor()
-    cursor.execute('SELECT id FROM agents WHERE name = ?', (name,))
-    result = cursor.fetchone()
-    return result[0] if result else None
+        self.spans.append(self.current_span)
+        self.current_span = None
 
+    def save(self) -> None:
+        """Save traces to file."""
+        if not self.spans:
+            return
 
-def check_agent_health(agent: Dict) -> Tuple[bool, float]:
-    """Check if an agent is healthy."""
-    agent_type = agent.get('type', 'local')
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        trace_file = self.trace_dir / f"{self.tool_name}_{timestamp}.jsonl"
 
-    if agent_type == 'local':
-        # Local agent - check if we can ping ourselves
-        start_time = time.time()
-        try:
-            # Simple check - just return True if running locally
-            response_time = (time.time() - start_time) * 1000  # ms
-            return True, response_time
-        except Exception as e:
-            return False, 0
-    elif agent_type == 'ssh':
-        # SSH agent - check connection
-        host = agent.get('host')
-        port = agent.get('port', 22)
-        start_time = time.time()
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            result = sock.connect_ex((host, port))
-            sock.close()
-            response_time = (time.time() - start_time) * 1000  # ms
-            return result == 0, response_time
-        except Exception as e:
-            return False, 0
-    else:
-        # Unknown type - assume unhealthy
-        return False, 0
+        with open(trace_file, "a") as f:
+            for span in self.spans:
+                f.write(json.dumps(span) + "\n")
+
+        self.spans = []
+
+    def get_recent_spans(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get recent spans from all trace files."""
+        spans = []
+
+        for trace_file in sorted(self.trace_dir.glob("*.jsonl"), reverse=True):
+            with open(trace_file, "r") as f:
+                for line in f:
+                    spans.append(json.loads(line))
+                    if len(spans) >= limit:
+                        return spans
+
+        return spans
 
 
-def record_health_check(agent_id: int, status: bool, response_time: float):
-    """Record health check result."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+# -----------------------------------------------------------------------------
+# Metrics
+# -----------------------------------------------------------------------------
 
-    now = datetime.now().isoformat()
-    cursor.execute('''
-        INSERT INTO health_checks (agent_id, status, response_time, checked_at)
-        VALUES (?, ?, ?, ?)
-    ''', (agent_id, 'healthy' if status else 'unhealthy', response_time, now))
+class MetricsCollector:
+    """Collect and aggregate metrics from traces."""
 
-    conn.commit()
-    conn.close()
+    def __init__(self, trace_dir: Path):
+        self.trace_dir = trace_dir
 
-
-def get_agent_status(conn: sqlite3.Connection, agent_id: int) -> Dict:
-    """Get agent status from latest health check."""
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        SELECT status, response_time, checked_at
-        FROM health_checks
-        WHERE agent_id = ?
-        ORDER BY checked_at DESC
-        LIMIT 1
-    ''', (agent_id,))
-
-    result = cursor.fetchone()
-    if result:
-        status, response_time, checked_at = result
-        return {
-            'status': status,
-            'response_time': response_time,
-            'last_check': checked_at
+    def collect_metrics(self, hours: int = 24) -> Dict[str, Any]:
+        """Collect metrics from recent traces."""
+        metrics = {
+            "total_operations": 0,
+            "total_errors": 0,
+            "operations_by_tool": {},
+            "errors_by_tool": {},
+            "avg_latency_ms": 0,
+            "p95_latency_ms": 0,
+            "p99_latency_ms": 0,
+            "recent_operations": [],
         }
-    return None
+
+        cutoff_time = datetime.utcnow().timestamp() - (hours * 3600)
+        latencies = []
+
+        for trace_file in sorted(self.trace_dir.glob("*.jsonl"), reverse=True):
+            with open(trace_file, "r") as f:
+                for line in f:
+                    span = json.loads(line)
+                    span_time = datetime.fromisoformat(span["start_time"]).timestamp()
+
+                    if span_time < cutoff_time:
+                        break
+
+                    metrics["total_operations"] += 1
+
+                    # Count by tool
+                    tool = span.get("tool", "unknown")
+                    metrics["operations_by_tool"][tool] = metrics["operations_by_tool"].get(tool, 0) + 1
+
+                    # Count errors
+                    if span.get("error"):
+                        metrics["total_errors"] += 1
+                        metrics["errors_by_tool"][tool] = metrics["errors_by_tool"].get(tool, 0) + 1
+
+                    # Collect latencies
+                    if "duration_ms" in span:
+                        latencies.append(span["duration_ms"])
+
+                    # Keep recent operations
+                    if len(metrics["recent_operations"]) < 10:
+                        metrics["recent_operations"].append(span)
+
+        # Calculate latency stats
+        if latencies:
+            latencies.sort()
+            metrics["avg_latency_ms"] = round(sum(latencies) / len(latencies), 2)
+            metrics["p95_latency_ms"] = latencies[int(len(latencies) * 0.95)]
+            metrics["p99_latency_ms"] = latencies[int(len(latencies) * 0.99)]
+
+        # Calculate error rate
+        if metrics["total_operations"] > 0:
+            metrics["error_rate"] = metrics["total_errors"] / metrics["total_operations"]
+        else:
+            metrics["error_rate"] = 0.0
+
+        return metrics
 
 
-def get_agent_metrics(conn: sqlite3.Connection, agent_id: int, hours: int = 24) -> Dict:
-    """Get agent performance metrics."""
-    cursor = conn.cursor()
+# -----------------------------------------------------------------------------
+# Alerts
+# -----------------------------------------------------------------------------
 
-    since = datetime.now() - timedelta(hours=hours)
+class AlertManager:
+    """Check metrics against thresholds and generate alerts."""
 
-    # Response times
-    cursor.execute('''
-        SELECT AVG(response_time) as avg, MIN(response_time) as min, MAX(response_time) as max
-        FROM health_checks
-        WHERE agent_id = ? AND checked_at >= ?
-    ''', (agent_id, since))
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.thresholds = config.get("alert_thresholds", DEFAULT_CONFIG["alert_thresholds"])
 
-    response_times = cursor.fetchone()
+    def check_metrics(self, metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Check metrics and return alerts."""
+        alerts = []
 
-    # Success rate
-    cursor.execute('''
-        SELECT
-            COUNT(CASE WHEN status = 'healthy' THEN 1 END) * 100.0 / COUNT(*) as success_rate
-        FROM health_checks
-        WHERE agent_id = ? AND checked_at >= ?
-    ''', (agent_id, since))
+        # Check error rate
+        if metrics["error_rate"] > self.thresholds.get("error_rate", 0.1):
+            alerts.append({
+                "severity": "warning",
+                "metric": "error_rate",
+                "value": metrics["error_rate"],
+                "threshold": self.thresholds["error_rate"],
+                "message": f"Error rate {metrics['error_rate']:.2%} exceeds threshold {self.thresholds['error_rate']:.2%}",
+            })
 
-    success_rate = cursor.fetchone()
+        # Check latency
+        if metrics["p95_latency_ms"] > self.thresholds.get("latency_ms", 5000):
+            alerts.append({
+                "severity": "warning",
+                "metric": "p95_latency_ms",
+                "value": metrics["p95_latency_ms"],
+                "threshold": self.thresholds["latency_ms"],
+                "message": f"P95 latency {metrics['p95_latency_ms']:.0f}ms exceeds threshold {self.thresholds['latency_ms']:.0f}ms",
+            })
 
-    # Output count
-    cursor.execute('''
-        SELECT COUNT(*) as count
-        FROM outputs
-        WHERE agent_id = ? AND captured_at >= ?
-    ''', (agent_id, since))
-
-    outputs = cursor.fetchone()
-
-    return {
-        'response_time': {
-            'avg': response_times[0] if response_times[0] else 0,
-            'min': response_times[1] if response_times[1] else 0,
-            'max': response_times[2] if response_times[2] else 0,
-        },
-        'success_rate': success_rate[0] if success_rate[0] else 0,
-        'output_count': outputs[0] if outputs else 0,
-    }
+        return alerts
 
 
-def format_status_emoji(status: str) -> str:
-    """Format status with emoji."""
-    if status == 'healthy':
-        return '✅'
-    elif status == 'unhealthy':
-        return '❌'
-    else:
-        return '❓'
+# -----------------------------------------------------------------------------
+# CLI Commands
+# -----------------------------------------------------------------------------
 
-
-def format_response_time(ms: float) -> str:
-    """Format response time in human-readable format."""
-    if ms < 1000:
-        return f"{ms:.0f}ms"
-    else:
-        return f"{ms/1000:.1f}s"
-
-
-def command_status(args):
-    """Show status of all squad agents."""
+def cmd_trace(args: argparse.Namespace) -> None:
+    """Trace a command."""
     config = load_config()
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    tracer = Tracer(args.tool, config)
 
-    cursor.execute('SELECT id, name, role FROM agents ORDER BY name')
-    agents = cursor.fetchall()
+    print(f"Tracing: {args.tool}")
+    print(f"Command: {' '.join(args.command)}")
 
-    print("🔍 Squad Observability Status\n")
-    print("Agents:")
+    span = tracer.start_span(" ".join(args.command))
 
-    all_healthy = True
+    start_time = time.time()
 
-    for agent_id, name, role in agents:
-        agent_config = config['agents'].get(name.lower(), {})
-        is_healthy, response_time = check_agent_health(agent_config)
-
-        record_health_check(agent_id, is_healthy, response_time)
-
-        status_str = format_status_emoji('healthy' if is_healthy else 'unhealthy')
-        response_str = format_response_time(response_time)
-
-        print(f"  {status_str} {name.capitalize()} ({role}) - {'Up' if is_healthy else 'Down'}")
-
-        if not is_healthy:
-            all_healthy = False
-
-    # Overall status
-    print(f"\nOverall Status: {'HEALTHY' if all_healthy else 'UNHEALTHY'}")
-
-    # Uptime calculation (last 24 hours)
-    cursor.execute('''
-        SELECT
-            COUNT(CASE WHEN status = 'healthy' THEN 1 END) * 100.0 / COUNT(*) as uptime
-        FROM health_checks
-        WHERE checked_at >= datetime('now', '-24 hours')
-    ''')
-    uptime = cursor.fetchone()[0]
-
-    print(f"Uptime: {uptime:.1f}% (24h)")
-
-    # Error rate
-    cursor.execute('''
-        SELECT
-            COUNT(CASE WHEN status = 'unhealthy' THEN 1 END) * 100.0 / COUNT(*) as error_rate
-        FROM health_checks
-        WHERE checked_at >= datetime('now', '-24 hours')
-    ''')
-    error_rate = cursor.fetchone()[0]
-
-    print(f"Error Rate: {error_rate:.1f}%")
-
-    conn.close()
-
-
-def command_monitor(args):
-    """Real-time monitoring mode."""
-    print("📡 Starting real-time monitoring (Ctrl+C to stop)")
-    print("")
-
+    # Run command
     try:
-        while True:
-            command_status(args)
-            print("\n" + "="*50 + "\n")
-            time.sleep(DEFAULT_CHECK_INTERVAL)
-    except KeyboardInterrupt:
-        print("\n\nMonitoring stopped.")
+        result = os.system(" ".join(args.command))
+        if result != 0:
+            tracer.end_span(f"Command failed with exit code {result}")
+        else:
+            duration_ms = (time.time() - start_time) * 1000
+            tracer.end_span()
+            print(f"✓ Completed in {duration_ms:.0f}ms")
+    except Exception as e:
+        tracer.end_span(str(e))
+        print(f"✗ Error: {e}")
+
+    tracer.save()
 
 
-def command_agent(args):
-    """Show detailed metrics for a specific agent."""
+def cmd_metrics(args: argparse.Namespace) -> None:
+    """Show metrics."""
     config = load_config()
-    conn = sqlite3.connect(DB_PATH)
+    trace_dir = expand_path(config.get("trace_dir", DEFAULT_CONFIG["trace_dir"]))
 
-    agent_name = args.agent.lower()
-    agent_id = get_agent_id(conn, agent_name)
-
-    if not agent_id:
-        print(f"❌ Agent '{args.agent}' not found")
-        conn.close()
+    if not trace_dir.exists():
+        print("No trace data found. Run traces first with 'squad-observability trace ...'")
         return
 
-    cursor = conn.cursor()
-    cursor.execute('SELECT name, role FROM agents WHERE id = ?', (agent_id,))
-    agent_info = cursor.fetchone()
+    collector = MetricsCollector(trace_dir)
+    hours = args.hours or 24
+    metrics = collector.collect_metrics(hours)
 
-    name, role = agent_info
+    print(f"\n=== Squad Metrics (last {hours}h) ===\n")
+    print(f"Total Operations: {metrics['total_operations']}")
+    print(f"Total Errors: {metrics['total_errors']}")
+    print(f"Error Rate: {metrics['error_rate']:.2%}")
+    print(f"\nLatency:")
+    print(f"  Avg: {metrics['avg_latency_ms']:.0f}ms")
+    print(f"  P95: {metrics['p95_latency_ms']:.0f}ms")
+    print(f"  P99: {metrics['p99_latency_ms']:.0f}ms")
 
-    print(f"📊 {name.capitalize()} Metrics (Last 24h)\n")
+    print(f"\nOperations by Tool:")
+    for tool, count in sorted(metrics["operations_by_tool"].items(), key=lambda x: x[1], reverse=True):
+        error_count = metrics["errors_by_tool"].get(tool, 0)
+        print(f"  {tool}: {count} ops, {error_count} errors")
 
-    # Status
-    status = get_agent_status(conn, agent_id)
-    if status:
-        status_emoji = format_status_emoji(status['status'])
-        response_str = format_response_time(status['response_time'])
-        print(f"Status: {status_emoji} {status['status'].upper()} - Last check: {status['last_check']}")
+    if args.json:
+        print("\n" + json.dumps(metrics, indent=2))
 
-    # Metrics
-    metrics = get_agent_metrics(conn, agent_id, hours=24)
 
-    print("\nPerformance:")
-    rt = metrics['response_time']
-    print(f"  Response Time: P50={format_response_time(rt['avg'])}, P95={format_response_time(rt['max'])}")
-    print(f"  Success Rate: {metrics['success_rate']:.1f}%")
+def cmd_alerts(args: argparse.Namespace) -> None:
+    """Check for alerts."""
+    config = load_config()
+    trace_dir = expand_path(config.get("trace_dir", DEFAULT_CONFIG["trace_dir"]))
 
-    print("\nActivity:")
-    print(f"  Output Count: {metrics['output_count']}")
+    if not trace_dir.exists():
+        print("No trace data found. Run traces first.")
+        return
 
-    # Recent alerts
-    cursor.execute('''
-        SELECT alert_type, severity, message, created_at
-        FROM alerts
-        WHERE agent_id = ? AND resolved = 0
-        ORDER BY created_at DESC
-        LIMIT 5
-    ''', (agent_id,))
+    collector = MetricsCollector(trace_dir)
+    alert_manager = AlertManager(config)
 
-    alerts = cursor.fetchall()
+    hours = args.hours or 24
+    metrics = collector.collect_metrics(hours)
+    alerts = alert_manager.check_metrics(metrics)
 
     if alerts:
-        print("\nAlerts:")
-        for alert_type, severity, message, created_at in alerts:
-            emoji = '⚠️' if severity == 'warning' else '🚨'
-            print(f"  {emoji} [{severity.upper()}] {message} - {created_at}")
-
-    conn.close()
-
-
-def command_report(args):
-    """Generate performance report."""
-    period = args.period
-    hours_map = {'daily': 24, 'weekly': 168, 'monthly': 720}
-    hours = hours_map.get(period, 24)
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    since = datetime.now() - timedelta(hours=hours)
-
-    print(f"# {period.capitalize()} Performance Report")
-    print(f"\n## Summary")
-    print(f"- Period: {since.date()} to {datetime.now().date()}")
-    print(f"- Check Interval: {DEFAULT_CHECK_INTERVAL}s")
-    print()
-
-    # Overall metrics
-    cursor.execute('''
-        SELECT COUNT(*) as total_checks,
-               SUM(CASE WHEN status = 'healthy' THEN 1 ELSE 0 END) as healthy_checks
-        FROM health_checks
-        WHERE checked_at >= ?
-    ''', (since,))
-
-    overall = cursor.fetchone()
-    total_checks, healthy_checks = overall
-
-    if total_checks > 0:
-        uptime = (healthy_checks / total_checks) * 100
-        print(f"Total Checks: {total_checks}")
-        print(f"Average Uptime: {uptime:.1f}%")
-
-    # Per-agent metrics
-    cursor.execute('SELECT id, name, role FROM agents ORDER BY name')
-    agents = cursor.fetchall()
-
-    print("\n## Agent Performance")
-
-    for agent_id, name, role in agents:
-        metrics = get_agent_metrics(conn, agent_id, hours=hours)
-
-        print(f"\n### {name.capitalize()} ({role})")
-        print(f"- Success Rate: {metrics['success_rate']:.1f}%")
-        print(f"- Output Count: {metrics['output_count']}")
-
-        rt = metrics['response_time']
-        print(f"- Response Time: Avg={format_response_time(rt['avg'])}, Max={format_response_time(rt['max'])}")
-
-    # Insights
-    print("\n## Insights")
-    print("- Monitoring system operational")
-    print("- All agents tracked for health and performance")
-    print(f"- Data retention: {args.period}")
-
-    conn.close()
+        print(f"\n=== Alerts (last {hours}h) ===\n")
+        for alert in alerts:
+            severity_emoji = "🔴" if alert["severity"] == "critical" else "⚠️"
+            print(f"{severity_emoji} {alert['message']}")
+    else:
+        print(f"\n✓ No alerts in the last {hours}h")
 
 
-def command_export(args):
-    """Export metrics in specified format."""
-    format_type = args.format
+def cmd_dashboard(args: argparse.Namespace) -> None:
+    """Generate a simple dashboard."""
+    config = load_config()
+    trace_dir = expand_path(config.get("trace_dir", DEFAULT_CONFIG["trace_dir"]))
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    if not trace_dir.exists():
+        print("No trace data found. Run traces first.")
+        return
 
-    # Get all agents with latest status
-    cursor.execute('''
-        SELECT
-            a.name,
-            a.role,
-            hc.status,
-            hc.response_time,
-            hc.checked_at
-        FROM agents a
-        LEFT JOIN (
-            SELECT
-                agent_id,
-                status,
-                response_time,
-                checked_at,
-                ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY checked_at DESC) as rn
-            FROM health_checks
-        ) hc ON a.id = hc.agent_id AND hc.rn = 1
-        ORDER BY a.name
-    ''')
+    collector = MetricsCollector(trace_dir)
+    alert_manager = AlertManager(config)
 
-    agents_data = cursor.fetchall()
+    hours = args.hours or 24
+    metrics = collector.collect_metrics(hours)
+    alerts = alert_manager.check_metrics(metrics)
 
-    if format_type == 'json':
-        output = []
-        for name, role, status, response_time, checked_at in agents_data:
-            output.append({
-                'name': name,
-                'role': role,
-                'status': status,
-                'response_time': response_time,
-                'last_check': checked_at,
-                'timestamp': datetime.now().isoformat()
-            })
-        print(json.dumps(output, indent=2))
+    print(f"\n{'='*60}")
+    print(f"  Squad Observability Dashboard")
+    print(f"{'='*60}\n")
 
-    elif format_type == 'prometheus':
-        for name, role, status, response_time, checked_at in agents_data:
-            status_val = 1 if status == 'healthy' else 0
-            print(f'squad_agent_up{{agent="{name}",role="{role}"}} {status_val}')
-            if response_time:
-                print(f'squad_agent_response_time_ms{{agent="{name}",role="{role}"}} {response_time}')
+    # Metrics
+    print(f"📊 Metrics (last {hours}h)")
+    print(f"{'─'*40}")
+    print(f"Operations: {metrics['total_operations']}")
+    print(f"Errors: {metrics['total_errors']}")
+    print(f"Error Rate: {metrics['error_rate']:.2%}")
+    print(f"Latency (P95): {metrics['p95_latency_ms']:.0f}ms")
 
-    conn.close()
+    # Alerts
+    if alerts:
+        print(f"\n⚠️ Alerts")
+        print(f"{'─'*40}")
+        for alert in alerts:
+            print(f"  • {alert['message']}")
+    else:
+        print(f"\n✓ No Alerts")
+
+    # Top Tools
+    print(f"\n🔧 Top Tools")
+    print(f"{'─'*40}")
+    for tool, count in sorted(metrics["operations_by_tool"].items(), key=lambda x: x[1], reverse=True)[:5]:
+        error_count = metrics["errors_by_tool"].get(tool, 0)
+        status = "✓" if error_count == 0 else "⚠️"
+        print(f"  {status} {tool}: {count} ops, {error_count} errors")
+
+    # Recent Operations
+    if metrics["recent_operations"]:
+        print(f"\n📋 Recent Operations")
+        print(f"{'─'*40}")
+        for op in metrics["recent_operations"][:5]:
+            tool = op.get("tool", "unknown")
+            operation = op.get("operation", "unknown")[:40]
+            duration = op.get("duration_ms", 0)
+            error = op.get("error")
+            status = "✗" if error else "✓"
+            print(f"  {status} {tool}: {operation} ({duration:.0f}ms)")
+            if error:
+                print(f"      Error: {error}")
+
+    print(f"\n{'='*60}\n")
 
 
-def main():
+def cmd_configure(args: argparse.Namespace) -> None:
+    """Configure observability settings."""
+    config = load_config()
+
+    if args.set:
+        key, value = args.set.split("=", 1)
+        # Try to parse as JSON, otherwise keep as string
+        try:
+            config[key] = json.loads(value)
+        except json.JSONDecodeError:
+            config[key] = value
+        print(f"Set {key} = {config[key]}")
+
+    save_config(config)
+
+    if not args.set:
+        print("Current configuration:")
+        print(json.dumps(config, indent=2))
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Monitor squad agents with AI observability",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  squad-observability status                    # Show status of all agents
-  squad-observability agent marcus               # Detailed metrics for Marcus
-  squad-observability monitor --live              # Real-time monitoring
-  squad-observability report --weekly             # Weekly performance report
-  squad-observability export --format json         # Export metrics as JSON
-        """
+        description="Squad Observability Layer — Monitor and debug squad agent operations"
     )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    # Trace command
+    trace_parser = subparsers.add_parser("trace", help="Trace a command")
+    trace_parser.add_argument("tool", help="Tool name (e.g., 'squad-briefing')")
+    trace_parser.add_argument("command", nargs="+", help="Command to trace")
+    trace_parser.set_defaults(func=cmd_trace)
 
-    # Status command
-    subparsers.add_parser('status', help='Show status of all squad agents')
+    # Metrics command
+    metrics_parser = subparsers.add_parser("metrics", help="Show metrics")
+    metrics_parser.add_argument("--hours", type=int, help="Hours of data to show")
+    metrics_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    metrics_parser.set_defaults(func=cmd_metrics)
 
-    # Monitor command
-    monitor_parser = subparsers.add_parser('monitor', help='Real-time monitoring')
-    monitor_parser.add_argument('--live', action='store_true',
-                           help='Live monitoring mode')
+    # Alerts command
+    alerts_parser = subparsers.add_parser("alerts", help="Check for alerts")
+    alerts_parser.add_argument("--hours", type=int, help="Hours of data to check")
+    alerts_parser.set_defaults(func=cmd_alerts)
 
-    # Agent command
-    agent_parser = subparsers.add_parser('agent', help='Detailed metrics for specific agent')
-    agent_parser.add_argument('agent', help='Agent name (marcus, galen, archimedes, argus)')
+    # Dashboard command
+    dashboard_parser = subparsers.add_parser("dashboard", help="Generate dashboard")
+    dashboard_parser.add_argument("--hours", type=int, help="Hours of data to show")
+    dashboard_parser.set_defaults(func=cmd_dashboard)
 
-    # Report command
-    report_parser = subparsers.add_parser('report', help='Generate performance report')
-    report_parser.add_argument('period', nargs='?', choices=['daily', 'weekly', 'monthly'],
-                          default='daily', help='Report period (default: daily)')
-
-    # Export command
-    export_parser = subparsers.add_parser('export', help='Export metrics')
-    export_parser.add_argument('--format', choices=['json', 'prometheus'],
-                          default='json', help='Export format (default: json)')
+    # Configure command
+    configure_parser = subparsers.add_parser("configure", help="Configure settings")
+    configure_parser.add_argument("--set", help="Set config key=value (JSON format)")
+    configure_parser.set_defaults(func=cmd_configure)
 
     args = parser.parse_args()
 
-    # Initialize
-    ensure_directories()
-    init_db()
-
-    # Ensure agents exist
-    config = load_config()
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    for name, agent_config in config['agents'].items():
-        cursor.execute('''
-            INSERT OR IGNORE INTO agents (name, role, host, port, agent_type)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (name, name.capitalize(), agent_config.get('host'),
-               agent_config.get('port'), agent_config.get('type')))
-
-    conn.commit()
-    conn.close()
-
-    # Execute command
-    if args.command == 'status':
-        command_status(args)
-    elif args.command == 'monitor':
-        command_monitor(args)
-    elif args.command == 'agent':
-        command_agent(args)
-    elif args.command == 'report':
-        command_report(args)
-    elif args.command == 'export':
-        command_export(args)
-    else:
+    if not args.command:
         parser.print_help()
+        return 1
+
+    args.func(args)
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
